@@ -1,7 +1,12 @@
 import zlib
 
 from binary_converters import convert_bin_to_int, convert_bin_to_text
-from print_helper import print_binary_format, print_hex_format, print_bytes, print_text, print_int
+from print_helper import print_hex_format, print_text, print_int
+
+
+# TODO: output chunk data to DD
+# TODO: Check all the CRC checks
+# TODO: verify how to write the table2 section
 
 
 def parse_segment_header(input_e01):
@@ -58,7 +63,6 @@ def parse_hash_section(input_e01, section_size, next_section_offset):
     print_hex_format(input_e01.read(4), "checksum: ")
 
 
-
 def parse_table2_section(input_e01, section_size, next_section_offset):
     input_e01.read(section_size - 76)
     print(f"Skipping {section_size - 76} bytes of table2 data")
@@ -77,9 +81,57 @@ def parse_data_section(input_e01, section_size, next_section_offset):
     print(f"Skipping {section_size - 76} bytes of data_section data")
 
 
-def parse_sectors_section(input_e01, section_size, next_section_offset):
-    input_e01.read(section_size - 76)
-    print(f"Skipping {section_size - 76} bytes with the image data")
+def parse_sectors_section(input_e01, sectors_section_size, next_section_offset):
+    print(f"Offset start of sectors section: {input_e01.tell() - 76}")
+    print(f"Offset end of sectors descriptor: {input_e01.tell()}")
+    input_e01.seek(sectors_section_size - 76, 1)  # Skip to the table section
+    start_of_table_section = input_e01.tell()
+    print(f"Skipping {sectors_section_size - 76} bytes with the image data")
+    section_type, next_section_offset, section_size = parse_section_descriptor(input_e01)
+    if section_type != 'table':
+        raise Exception(f'The first section after the sectors section should be a table section, not {section_type}')
+
+    # Get the block offsets from the table section
+    table_base_offset, block_offsets = parse_table_section(input_e01, section_size, next_section_offset)
+    after_table_section = input_e01.tell()
+
+    # Read the block from the sectors section
+    for i in range(len(block_offsets)):
+        print(f"Chunk {i}")
+        if block_offsets[i] > 2147483647:
+            compression = True
+            block_offset = block_offsets[i] - 2147483647
+        else:
+            compression = False
+            block_offset = block_offsets[i]
+        if i < len(block_offsets) - 1:
+            block_size = block_offsets[i + 1] - block_offset
+            if block_offsets[i + 1] > 2147483647:
+                block_size = (block_size - 2147483647)
+            else:
+                block_size = block_size + 1  # No idea why there is one byte missing in size if the next block is not compressed.
+            print(f"Next block offset {block_offsets[i + 1]}")
+        else:
+            block_size = start_of_table_section - table_base_offset - block_offset + 1
+
+        input_e01.seek(table_base_offset + block_offset - 1, 0)
+        print(f"Block offset {block_offsets[i]}")
+        print(f"Block offset {block_offset}")
+        print(f"Block size {block_size}")
+        print(f"Current position = {input_e01.tell()}")
+        if compression:
+            chunk_data = read_zlib_data(input_e01, block_size)
+            checksum = chunk_data[-4:]
+            chunk_data = chunk_data[:-4]
+        else:
+            chunk_data = input_e01.read(block_size - 4)
+            checksum = input_e01.read(4)
+    input_e01.seek(after_table_section, 0)
+    section_type, next_section_offset, section_size = parse_section_descriptor(input_e01)
+    if section_type == "table2":
+        input_e01.seek(next_section_offset, 0)
+    else:
+        raise Exception(f"Table 2 section expected after table section.")
 
 
 def parse_volume_section(input_e01, section_size, next_section_offset):
@@ -118,12 +170,15 @@ def parse_table_section(input_e01, section_size, next_section_offset):
     entries_number = convert_bin_to_int(input_e01.read(4))
     print(f"number of table entries: {entries_number}")
     print_hex_format(input_e01.read(4), "padding: ")
-    print_int(input_e01.read(8), "table base offset: ")
+    table_base_offset = convert_bin_to_int(input_e01.read(8))
+    print(f"table base offset: {table_base_offset}")
     print_hex_format(input_e01.read(4), "padding: ")
     print_hex_format(input_e01.read(4), "checksum: ")
     print(f"skipping {entries_number * 4} bytes of chunk offsets")
-    input_e01.read(entries_number * 4)
+    entries_blob = input_e01.read(entries_number * 4)
+    block_offsets = [convert_bin_to_int(entries_blob[i:i + 4]) for i in range(0, len(entries_blob), 4)]
     print_hex_format(input_e01.read(4), "checksum: ")
+    return table_base_offset, block_offsets
 
 
 def parse_header_section(input_e01, section_size, next_section_offset):
@@ -154,9 +209,9 @@ def parse_section_descriptor(input_e01):
         convert_bin_to_int(section_size_blob)
 
 
-
 def read_zlib_data(input_e01, size):
     compressed_data = input_e01.read(size)
+    # print_hex_format(compressed_data)
     return zlib.decompress(compressed_data)
 
 
