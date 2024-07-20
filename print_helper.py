@@ -14,8 +14,8 @@ def print_hex_format(input_bytes, label=""):
     print(label + ' '.join(f'\\x{byte:02x}' for byte in input_bytes))
 
 
-def print_text(input_bytes, label="", encoding='ascii'):
-    print(label + input_bytes.decode(encoding))
+def print_text(input_bytes, label="", footer="", encoding='ascii'):
+    print(label + input_bytes.decode(encoding) + footer)
 
 
 def print_int(input_bytes, label=""):

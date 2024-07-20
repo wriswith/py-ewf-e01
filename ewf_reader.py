@@ -1,11 +1,9 @@
 import zlib
 
-from binary_converters import convert_bin_to_int, convert_bin_to_text
+from binary_helper import convert_bin_to_int, convert_bin_to_text
 from print_helper import print_hex_format, print_text, print_int, print_binary_format
 from verify_hash import calculate_hash
 
-
-# TODO: output chunk data to DD
 # TODO: Check all the CRC checks
 # TODO: verify how to write the table2 section
 
@@ -20,7 +18,7 @@ def parse_segment_header(input_e01):
     return segment_number
 
 
-def debug_e01(input_path, output_path):
+def convert_e01_to_dd(input_path, output_path):
     output_file = open(output_path, 'wb')
     with open(input_path, 'rb') as input_e01:
         parse_segment_header(input_e01)
@@ -97,41 +95,28 @@ def parse_sectors_section(input_e01, sectors_section_size, next_section_offset, 
 
     # Read the block from the sectors section
     for i in range(len(block_offsets)):
-        if block_offsets[i] > 2147483647:
-            compression = True
-            block_offset = block_offsets[i] - 2147483647
-        else:
-            compression = False
-            block_offset = block_offsets[i]
+        compression = block_offsets[i][0]
+        block_offset = block_offsets[i][1]
+        print(f"Block offset {block_offsets[i]}")
         if i < len(block_offsets) - 1:
-            block_size = block_offsets[i + 1] - block_offset
-            if block_offsets[i + 1] > 2147483647:
-                block_size = (block_size - 2147483647)
-            else:
-                block_size = block_size + 1  # No idea why there is one byte missing in size if the next block is not compressed.
+            block_size = block_offsets[i + 1][1] - block_offset
             print(f"Next block offset {block_offsets[i + 1]}")
         else:
-            block_size = start_of_table_section - table_base_offset - block_offset + 1
+            block_size = start_of_table_section - table_base_offset - block_offset
 
-
-        print(f"Block offset {block_offsets[i]}")
         print(f"Block size {block_size}")
         print(f"Current position = {input_e01.tell()}")
+        input_e01.seek(table_base_offset + block_offset, 0)
         if compression:
-            input_e01.seek(table_base_offset + block_offset - 1, 0)  # Why minus 1
             chunk_data = read_zlib_data(input_e01, block_size)
         else:
-            input_e01.seek(table_base_offset + block_offset, 0)  # Why not minus 1
-            chunk_data = input_e01.read(block_size - 5)  # Why minus 5 and not 4? The checksum is 4.
-            checksum = input_e01.read(4)
+            chunk_data = input_e01.read(block_size - 4)
+            checksum = convert_bin_to_int(input_e01.read(4))
+            if zlib.adler32(chunk_data) != checksum:
+                raise Exception(f"Checksum failure ({zlib.adler32(chunk_data)} != {checksum})")
+
         output_file.write(chunk_data)
-        test_bytes = bytes.fromhex(r'\xa5 \x2a \x6e \x9b \x1e \x68 \xd8 \xff \x00 \xbc \x20 \x93 \x9c \x10'
-                                   .replace(r'\x', '').replace(' ', ''))
-        # if test_bytes in chunk_data:
-        #     print(f"pattern found (compression: {compression})")
-        #     print_hex_format(chunk_data)
-        #
-        #     break
+
     input_e01.seek(after_table_section, 0)
     section_type, next_section_offset, section_size = parse_section_descriptor(input_e01)
     if section_type == "table2":
@@ -184,15 +169,17 @@ def parse_table_section(input_e01, section_size, next_section_offset):
     entries_blob = input_e01.read(entries_number * 4)
     block_offsets = []
     for i in range(0, len(entries_blob), 4):
-
-        block_offsets.append(convert_bin_to_int(entries_blob[i:i + 4]))
-        if convert_bin_to_int(entries_blob[i:i + 4]) > 2147483647:  # convert to mask  '& 0x7FFFFFFF'
-            print_binary_format(entries_blob[i:i + 4], 'Compression True: ')
+        # Read the entry value as int
+        original_entry = int.from_bytes(entries_blob[i:i + 4], byteorder='little')
+        # Read the actual offset without taking the MSB value into account which is a flag for compression
+        msb_cleared_entry = original_entry & 0x7FFFFFFF
+        # Store the compression flag in a separate boolean
+        if original_entry == msb_cleared_entry:
+            compression = False
         else:
-            print_binary_format(entries_blob[i:i + 4], 'Compression False: ')
-
+            compression = True
+        block_offsets.append((compression, msb_cleared_entry))
     print_hex_format(input_e01.read(4), "checksum: ")
-    exit(-1)
     return table_base_offset, block_offsets
 
 
@@ -205,29 +192,41 @@ def parse_header_section(input_e01, section_size, next_section_offset):
     :return:
     """
     uncompressed_data = read_zlib_data(input_e01, section_size - 76)
-    print_text(uncompressed_data, "header section data: ")
+    print_text(uncompressed_data, "header section data: |", footer="|")
 
 
 def parse_section_descriptor(input_e01):
     print(f"----------Section descriptor----------")
-    type_blob = input_e01.read(16)
-    section_type = convert_bin_to_text(type_blob).rstrip('\x00')
-    print(f"type: {section_type}")
-    next_section_offset_blob = input_e01.read(8)
-    print_int(next_section_offset_blob, "offset to next section: ")
-    section_size_blob = input_e01.read(8)
-    print_int(section_size_blob, "section size: ")
-    print_hex_format(input_e01.read(40), "Padding: ")
-    print_hex_format(input_e01.read(4), "checksum: ")
-    return section_type, \
-        convert_bin_to_int(next_section_offset_blob), \
-        convert_bin_to_int(section_size_blob)
+    descriptor_blob = input_e01.read(72)
+    try:
+        type_blob = descriptor_blob[0:16]
+        section_type = convert_bin_to_text(type_blob).rstrip('\x00')
+        print(f"type: {section_type}")
+        next_section_offset_blob = descriptor_blob[16:24]
+        print_int(next_section_offset_blob, "offset to next section: ")
+        section_size_blob = descriptor_blob[24:32]
+        print_int(section_size_blob, "section size: ")
+        print_hex_format(descriptor_blob[32:72], "Padding: ")
+        checksum = convert_bin_to_int(input_e01.read(4))
+        print(f"checksum: {checksum}")
+        if zlib.adler32(descriptor_blob) != checksum:
+            raise Exception(f"The checksum for the section descriptor is incorrect! ({zlib.adler32(descriptor_blob)} != {checksum}")
+        return section_type, \
+            convert_bin_to_int(next_section_offset_blob), \
+            convert_bin_to_int(section_size_blob)
+    except Exception as e:
+        print_hex_format(descriptor_blob)
+        raise e
 
 
 def read_zlib_data(input_e01, size):
     compressed_data = input_e01.read(size)
-    # print_hex_format(compressed_data)
-    return zlib.decompress(compressed_data)
+    try:
+        uncompressed_data = zlib.decompress(compressed_data)
+    except zlib.error as e:
+        print_hex_format(compressed_data)
+        raise e
+    return uncompressed_data
 
 
 def parse_header2_section(input_e01, section_size, next_section_offset):
@@ -255,13 +254,14 @@ def read_header_2_line(uncompressed_data, start_of_line):
 
 
 if __name__ == '__main__':
-    input_path_main = r"C:\Users\447979443\OneDrive - Office 365 GPI\Old\ewf-test\test1.E01"
+    input_path_main = r"C:\temp\generated_test1.e01"
+    # input_path_main = r"C:\Users\bruno\OneDrive - Office 365 GPI\Old\ewf-test\test1.E01"
     output_path_main = r"C:\temp\test1.dd"
     # input_path_main = r"C:\Users\447979443\OneDrive - Office 365 GPI\Old\ewf-test\test2.E01"
     # output_path_main = r"C:\temp\test2.dd"
 
-    verification_dd_path = r"C:\Users\447979443\OneDrive - Office 365 GPI\Old\ewf-test\test1.dd"
-    debug_e01(input_path_main, output_path_main)
+    verification_dd_path = r"C:\Users\bruno\OneDrive - Office 365 GPI\Old\ewf-test\test1.dd"
+    convert_e01_to_dd(input_path_main, output_path_main)
     print(calculate_hash(output_path_main))
     print(calculate_hash(verification_dd_path))
     # with open(output_path_main, 'rb') as t1:
